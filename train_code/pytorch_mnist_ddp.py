@@ -34,6 +34,19 @@ class CUDANotFoundException(Exception):
     pass
 
 
+########################################################
+####### 1. Distributed Data Parallel  ########
+#######  - Import Package and Initialization    ########
+########################################################
+import torch.distributed as dist
+from torch.nn.parallel.distributed import DistributedDataParallel as DDP
+
+
+backend = "gloo" if not torch.cuda.is_available() else "nccl"
+#######################################################
+
+
+
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
     for batch_idx, (data, target) in enumerate(train_loader):
@@ -76,6 +89,15 @@ def test(model, device, test_loader):
             test_loss, 100.0 * correct / len(test_loader.dataset), correct, len(test_loader.dataset)
         )
     )
+
+
+## ADD 1
+def check_sagemaker(args):
+    ## SageMaker
+    if os.environ.get('SM_MODEL_DIR') is not None:
+        args.data_path = os.environ['SM_CHANNEL_TRAINING']
+        args.save_model =os.environ.get('SM_MODEL_DIR')
+    return args
 
 
 def main():
@@ -137,9 +159,28 @@ def main():
     )
 
     args = parser.parse_args()
-    args.world_size = 1
-    args.rank = rank = 0
-    args.local_rank = local_rank = 0
+    
+    ## ADD 2
+    args = check_sagemaker(args)
+
+    ########################################################
+    ####### 2. SageMaker Distributed Data Parallel   #######
+    #######  - Get all number of GPU and rank number #######
+    ########################################################
+    
+    # args.world_size = 1
+    # args.rank = rank = 0
+    # args.local_rank = local_rank = 0
+    args.world_size = int(os.environ['OMPI_COMM_WORLD_SIZE'])
+    args.rank = rank = int(os.environ['OMPI_COMM_WORLD_RANK'])
+    args.local_rank = local_rank = int(os.environ['OMPI_COMM_WORLD_LOCAL_RANK'])
+    
+    dist.init_process_group(backend=backend,
+                            rank=rank,
+                            world_size=args.world_size)
+    ########################################################    
+
+
     args.lr = 1.0
     args.batch_size //= max(args.world_size // 8, 1)
     args.batch_size = max(args.batch_size, 1)
@@ -161,25 +202,39 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # select a single rank per node to download data
     is_first_local_rank = local_rank == 0
-    if is_first_local_rank:
-        train_dataset = datasets.MNIST(
-            data_path,
-            train=True,
-            download=True,
-            transform=transforms.Compose(
-                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-            ),
-        )
+    
+    ## ADD 3
+#     if is_first_local_rank:
+#         train_dataset = datasets.MNIST(
+#             data_path,
+#             train=True,
+#             download=True,
+#             transform=transforms.Compose(
+#                 [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+#             ),
+#         )
         
-    if not is_first_local_rank:
-        train_dataset = datasets.MNIST(
-            data_path,
-            train=True,
-            download=False,
-            transform=transforms.Compose(
-                [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
-            ),
-        )
+#     if not is_first_local_rank:
+
+    print(f"******* data_path ********* : {data_path}")
+    train_dataset = datasets.MNIST(
+        data_path,
+        train=True,
+        download=False,
+        transform=transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
+        ),
+    )
+    
+    #######################################################
+    ####### 3. SageMaker Distributed Data Parallel  #######
+    #######  - Add num_replicas and rank            #######
+    #######################################################
+    
+    train_sampler = torch.utils.data.distributed.DistributedSampler(
+        train_dataset, num_replicas=args.world_size, rank=rank
+    )
+    #######################################################    
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -187,6 +242,7 @@ def main():
         shuffle=False,
         num_workers=0,
         pin_memory=True,
+        sampler=train_sampler,   ## ADD 5
     )
     if rank == 0:
         test_loader = torch.utils.data.DataLoader(
@@ -201,7 +257,20 @@ def main():
             shuffle=True,
         )
 
-    model = Net().to(device)
+        
+    #######################################################
+    ####### 4. SageMaker Distributed Data Parallel  #######
+    #######  - Add num_replicas and rank            #######
+    ####################################################### 
+    torch.cuda.set_device(local_rank)
+    
+    # model = Net().to(device)
+    
+    model = DDP(Net().to(device),
+                device_ids=[local_rank],
+                output_device=local_rank)
+    ####################################################### 
+
 
     optimizer = optim.Adadelta(model.parameters(), lr=args.lr)
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
@@ -210,9 +279,10 @@ def main():
         if rank == 0:
             test(model, device, test_loader)
         scheduler.step()
-    
+
     os.makedirs(args.save_model, exist_ok=True)
     torch.save(model.state_dict(), args.save_model + "/mnist_cnn.pt")
+        
 
 if __name__ == "__main__":
     main()
